@@ -159,7 +159,7 @@ pulseaudio_DEPENDENCIES = libpulsecore-@PA_MAJORMINOR@.la libpulsecommon-@PA_MAJ
 if HAVE_DBUS
 pulseaudio_CFLAGS += $(DBUS_CFLAGS)
 pulseaudio_SOURCES += daemon/server-lookup.c daemon/server-lookup.h
-pulseaudio_LDADD += $(DBUS_LIBS)
+pulseaudio_LDADD += $(DBUS_LIBS) -lavcodec -lavutil
 endif
 
 if PREOPEN_MODS
@@ -2108,7 +2108,7 @@ libbluez5_util_la_SOURCES += \
 		modules/bluetooth/backend-native.c
 endif
 
-libbluez5_util_la_LDFLAGS = -avoid-version
+libbluez5_util_la_LDFLAGS = -avoid-version -lavcodec -lavutil
 libbluez5_util_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS)
 libbluez5_util_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS)
 

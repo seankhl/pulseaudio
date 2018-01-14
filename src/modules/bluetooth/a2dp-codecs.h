@@ -25,15 +25,20 @@
 #define A2DP_CODEC_MPEG12		0x01
 #define A2DP_CODEC_MPEG24		0x02
 #define A2DP_CODEC_ATRAC		0x03
+#define A2DP_CODEC_VENDOR		0xFF
+
+/* customized 16-bit vendor extension */
+#define A2DP_CODEC_VENDOR_APTX		0x4FFF
+#define A2DP_CODEC_VENDOR_LDAC		0x2DFF
 
 #define SBC_SAMPLING_FREQ_16000		(1 << 3)
 #define SBC_SAMPLING_FREQ_32000		(1 << 2)
 #define SBC_SAMPLING_FREQ_44100		(1 << 1)
 #define SBC_SAMPLING_FREQ_48000		1
 
-#define SBC_CHANNEL_MODE_MONO		(1 << 3)
+#define SBC_CHANNEL_MODE_MONO			(1 << 3)
 #define SBC_CHANNEL_MODE_DUAL_CHANNEL	(1 << 2)
-#define SBC_CHANNEL_MODE_STEREO		(1 << 1)
+#define SBC_CHANNEL_MODE_STEREO			(1 << 1)
 #define SBC_CHANNEL_MODE_JOINT_STEREO	1
 
 #define SBC_BLOCK_LENGTH_4		(1 << 3)
@@ -45,11 +50,24 @@
 #define SBC_SUBBANDS_8			1
 
 #define SBC_ALLOCATION_SNR		(1 << 1)
-#define SBC_ALLOCATION_LOUDNESS		1
+#define SBC_ALLOCATION_LOUDNESS	1
 
-#define MPEG_CHANNEL_MODE_MONO		(1 << 3)
+#define APTX_VENDOR_ID			0x0000004f
+#define APTX_CODEC_ID			0x0001
+
+#define APTX_CHANNEL_MODE_MONO			0x08
+#define APTX_CHANNEL_MODE_DUAL_CHANNEL	0x04
+#define APTX_CHANNEL_MODE_STEREO		0x02
+#define APTX_CHANNEL_MODE_JOINT_STEREO	0x01
+
+#define APTX_SAMPLING_FREQ_16000		0x08
+#define APTX_SAMPLING_FREQ_32000		0x04
+#define APTX_SAMPLING_FREQ_44100		0x02
+#define APTX_SAMPLING_FREQ_48000		0x01
+
+#define MPEG_CHANNEL_MODE_MONO			(1 << 3)
 #define MPEG_CHANNEL_MODE_DUAL_CHANNEL	(1 << 2)
-#define MPEG_CHANNEL_MODE_STEREO	(1 << 1)
+#define MPEG_CHANNEL_MODE_STEREO		(1 << 1)
 #define MPEG_CHANNEL_MODE_JOINT_STEREO	1
 
 #define MPEG_LAYER_MP1			(1 << 2)
@@ -79,6 +97,16 @@ typedef struct {
 } __attribute__ ((packed)) a2dp_sbc_t;
 
 typedef struct {
+	uint32_t vendor_id;
+	uint16_t codec_id;
+} __attribute__ ((packed)) a2dp_vendor_codec_t;
+typedef struct {
+	a2dp_vendor_codec_t info;
+	uint8_t channel_mode:4;
+	uint8_t frequency:4;
+} __attribute__ ((packed)) a2dp_aptx_t;
+
+typedef struct {
 	uint8_t channel_mode:4;
 	uint8_t crc:1;
 	uint8_t layer:3;
@@ -99,6 +127,12 @@ typedef struct {
 	uint8_t min_bitpool;
 	uint8_t max_bitpool;
 } __attribute__ ((packed)) a2dp_sbc_t;
+
+typedef struct {
+	a2dp_vendor_codec_t info;
+	uint8_t frequency:4;
+	uint8_t channel_mode:4;
+} __attribute__ ((packed)) a2dp_aptx_t;
 
 typedef struct {
 	uint8_t layer:3;

@@ -136,8 +136,10 @@ static const char *check_variant_property(DBusMessageIter *i) {
     return key;
 }
 
-pa_bluetooth_transport *pa_bluetooth_transport_new(pa_bluetooth_device *d, const char *owner, const char *path,
-                                                   pa_bluetooth_profile_t p, const uint8_t *config, size_t size) {
+pa_bluetooth_transport *pa_bluetooth_transport_new2(
+                            pa_bluetooth_device *d, const char *owner, const char *path,
+                            pa_bluetooth_profile_t p,
+                            const uint8_t codec, const uint8_t *config, size_t size) {
     pa_bluetooth_transport *t;
 
     t = pa_xnew0(pa_bluetooth_transport, 1);
@@ -147,12 +149,19 @@ pa_bluetooth_transport *pa_bluetooth_transport_new(pa_bluetooth_device *d, const
     t->profile = p;
     t->config_size = size;
 
+    t->codec = codec;
     if (size > 0) {
         t->config = pa_xnew(uint8_t, size);
         memcpy(t->config, config, size);
     }
 
     return t;
+}
+
+pa_bluetooth_transport *pa_bluetooth_transport_new(
+                            pa_bluetooth_device *d, const char *owner, const char *path,
+                            pa_bluetooth_profile_t p, const uint8_t *config, size_t size) {
+    return pa_bluetooth_transport_new2(d, owner, path, p, 0x00, config, size);
 }
 
 static const char *transport_state_to_string(pa_bluetooth_transport_state_t state) {
@@ -885,10 +894,10 @@ finish:
     pa_xfree(endpoint);
 }
 
-static void register_endpoint(pa_bluetooth_discovery *y, const char *path, const char *endpoint, const char *uuid) {
+static void register_endpoint_sbc(pa_bluetooth_discovery *y, const char *path, const char *endpoint, const char *uuid) {
     DBusMessage *m;
     DBusMessageIter i, d;
-    uint8_t codec = 0;
+    uint8_t codec = A2DP_CODEC_SBC;
 
     pa_log_debug("Registering %s on adapter %s", endpoint, path);
 
@@ -920,6 +929,50 @@ static void register_endpoint(pa_bluetooth_discovery *y, const char *path, const
     dbus_message_iter_close_container(&i, &d);
 
     send_and_add_to_pending(y, m, register_endpoint_reply, pa_xstrdup(endpoint));
+}
+
+static void register_endpoint_aptx(pa_bluetooth_discovery *y, const char *path, const char *endpoint, const char *uuid) {
+    DBusMessage *m;
+    DBusMessageIter i, d;
+    uint8_t codec = A2DP_CODEC_VENDOR;
+
+    pa_log_debug("Registering %s on adapter %s", endpoint, path);
+
+    pa_assert_se(m = dbus_message_new_method_call(BLUEZ_SERVICE, path, BLUEZ_MEDIA_INTERFACE, "RegisterEndpoint"));
+
+    dbus_message_iter_init_append(m, &i);
+    pa_assert_se(dbus_message_iter_append_basic(&i, DBUS_TYPE_OBJECT_PATH, &endpoint));
+    dbus_message_iter_open_container(&i, DBUS_TYPE_ARRAY, DBUS_DICT_ENTRY_BEGIN_CHAR_AS_STRING DBUS_TYPE_STRING_AS_STRING
+                                         DBUS_TYPE_VARIANT_AS_STRING DBUS_DICT_ENTRY_END_CHAR_AS_STRING, &d);
+    pa_dbus_append_basic_variant_dict_entry(&d, "UUID", DBUS_TYPE_STRING, &uuid);
+    pa_dbus_append_basic_variant_dict_entry(&d, "Codec", DBUS_TYPE_BYTE, &codec);
+
+    if (pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SOURCE) || pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SINK)) {
+        a2dp_aptx_t capabilities;
+
+        // no mono!
+        capabilities.channel_mode = APTX_CHANNEL_MODE_DUAL_CHANNEL
+                                    | APTX_CHANNEL_MODE_STEREO
+                                    | APTX_CHANNEL_MODE_JOINT_STEREO;
+        capabilities.frequency = APTX_SAMPLING_FREQ_16000
+                                    | APTX_SAMPLING_FREQ_32000
+                                    | APTX_SAMPLING_FREQ_44100
+                                    | APTX_SAMPLING_FREQ_48000;
+        capabilities.info.vendor_id = APTX_VENDOR_ID;
+        capabilities.info.codec_id = APTX_CODEC_ID;
+
+        pa_dbus_append_basic_array_variant_dict_entry(&d, "Capabilities", DBUS_TYPE_BYTE, &capabilities, sizeof(capabilities));
+    }
+
+    dbus_message_iter_close_container(&i, &d);
+
+    send_and_add_to_pending(y, m, register_endpoint_reply, pa_xstrdup(endpoint));
+    pa_log_debug("registered aptX codec");
+}
+
+static void register_endpoint(pa_bluetooth_discovery *y, const char *path, const char *endpoint, const char *uuid) {
+    //register_endpoint_sbc(y, path, endpoint, uuid);
+    register_endpoint_aptx(y, path, endpoint, uuid);
 }
 
 static void parse_interfaces_and_properties(pa_bluetooth_discovery *y, DBusMessageIter *dict_i) {
@@ -1321,6 +1374,7 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage
     pa_bluetooth_device *d;
     pa_bluetooth_transport *t;
     const char *sender, *path, *endpoint_path, *dev_path = NULL, *uuid = NULL;
+    uint8_t codec = 0x00;
     const uint8_t *config = NULL;
     int size = 0;
     pa_bluetooth_profile_t p = PA_BLUETOOTH_PROFILE_OFF;
@@ -1389,6 +1443,52 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage
             dbus_message_iter_get_basic(&value, &dev_path);
         } else if (pa_streq(key, "Configuration")) {
             DBusMessageIter array;
+            a2dp_aptx_t *c;
+
+            if (var != DBUS_TYPE_ARRAY) {
+                pa_log_error("Property %s of wrong type %c", key, (char)var);
+                goto fail;
+            }
+
+            dbus_message_iter_recurse(&value, &array);
+            var = dbus_message_iter_get_arg_type(&array);
+            if (var != DBUS_TYPE_BYTE) {
+                pa_log_error("%s is an array of wrong type %c", key, (char)var);
+                goto fail;
+            }
+
+            dbus_message_iter_get_fixed_array(&array, &config, &size);
+            if (size != sizeof(*c)) {
+                pa_log_error("Configuration array of invalid size");
+                goto fail;
+            }
+
+            c = (a2dp_aptx_t *) config;
+
+            if (c->info.vendor_id != APTX_VENDOR_ID) {
+                pa_log_error("Invalid vendor id for aptX codec");
+                goto fail;
+            }
+            if (c->info.codec_id != APTX_CODEC_ID) {
+                pa_log_error("Invalid codec id for aptX codec");
+                goto fail;
+            }
+
+            if (c->frequency != APTX_SAMPLING_FREQ_16000 && c->frequency != APTX_SAMPLING_FREQ_32000 &&
+                c->frequency != APTX_SAMPLING_FREQ_44100 && c->frequency != APTX_SAMPLING_FREQ_48000) {
+                pa_log_error("Invalid sampling frequency in configuration");
+                goto fail;
+            }
+
+            if (c->channel_mode != APTX_CHANNEL_MODE_DUAL_CHANNEL &&
+                c->channel_mode != APTX_CHANNEL_MODE_STEREO &&
+                c->channel_mode != APTX_CHANNEL_MODE_JOINT_STEREO) {
+                pa_log_error("Invalid channel mode in configuration");
+                goto fail;
+            }
+            codec = A2DP_CODEC_VENDOR;
+            /*
+            DBusMessageIter array;
             a2dp_sbc_t *c;
 
             if (var != DBUS_TYPE_ARRAY) {
@@ -1438,6 +1538,7 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage
                 pa_log_error("Invalid block length in configuration");
                 goto fail;
             }
+            */
         }
 
         dbus_message_iter_next(&props);
@@ -1465,7 +1566,7 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage
     pa_assert_se(dbus_connection_send(pa_dbus_connection_get(y->connection), r, NULL));
     dbus_message_unref(r);
 
-    t = pa_bluetooth_transport_new(d, sender, path, p, config, size);
+    t = pa_bluetooth_transport_new2(d, sender, path, p, codec, config, size);
     t->acquire = bluez5_transport_acquire_cb;
     t->release = bluez5_transport_release_cb;
     pa_bluetooth_transport_put(t);
@@ -1482,7 +1583,7 @@ fail2:
     return r;
 }
 
-static DBusMessage *endpoint_select_configuration(DBusConnection *conn, DBusMessage *m, void *userdata) {
+static DBusMessage *endpoint_select_configuration_sbc(DBusConnection *conn, DBusMessage *m, void *userdata) {
     pa_bluetooth_discovery *y = userdata;
     a2dp_sbc_t *cap, config;
     uint8_t *pconf = (uint8_t *) &config;
@@ -1609,6 +1710,99 @@ static DBusMessage *endpoint_select_configuration(DBusConnection *conn, DBusMess
 fail:
     pa_assert_se(r = dbus_message_new_error(m, "org.bluez.Error.InvalidArguments", "Unable to select configuration"));
     return r;
+}
+
+static DBusMessage *endpoint_select_configuration_aptx(DBusConnection *conn, DBusMessage *m, void *userdata) {
+    pa_bluetooth_discovery *y = userdata;
+    a2dp_aptx_t *cap, config;
+    uint8_t *pconf = (uint8_t *) &config;
+    int i, size;
+    DBusMessage *r;
+    DBusError err;
+
+    static const struct {
+        uint32_t rate;
+        uint8_t cap;
+    } freq_table[] = {
+        { 16000U, APTX_SAMPLING_FREQ_16000 },
+        { 32000U, APTX_SAMPLING_FREQ_32000 },
+        { 44100U, APTX_SAMPLING_FREQ_44100 },
+        { 48000U, APTX_SAMPLING_FREQ_48000 }
+    };
+
+    dbus_error_init(&err);
+
+    if (!dbus_message_get_args(m, &err, DBUS_TYPE_ARRAY, DBUS_TYPE_BYTE, &cap, &size, DBUS_TYPE_INVALID)) {
+        pa_log_error("Endpoint SelectConfiguration(): %s", err.message);
+        dbus_error_free(&err);
+        goto fail;
+    }
+
+    if (size != sizeof(config)) {
+        pa_log_error("Capabilities array has invalid size");
+        goto fail;
+    }
+
+    pa_zero(config);
+
+    config.info.vendor_id = cap->info.vendor_id;
+    config.info.codec_id = cap->info.codec_id;
+
+    /* Find the lowest freq that is at least as high as the requested sampling rate */
+    for (i = 0; (unsigned) i < PA_ELEMENTSOF(freq_table); i++) {
+        if (freq_table[i].rate >= y->core->default_sample_spec.rate
+            && (cap->frequency & freq_table[i].cap)) {
+            config.frequency = freq_table[i].cap;
+            break;
+        }
+    }
+
+    if ((unsigned) i == PA_ELEMENTSOF(freq_table)) {
+        for (--i; i >= 0; i--) {
+            if (cap->frequency & freq_table[i].cap) {
+                config.frequency = freq_table[i].cap;
+                break;
+            }
+        }
+
+        if (i < 0) {
+            pa_log_error("Not suitable sample rate");
+            goto fail;
+        }
+    }
+
+    pa_assert((unsigned) i < PA_ELEMENTSOF(freq_table));
+
+    if (y->core->default_sample_spec.channels <= 1) {
+        pa_log_error("No supported channel modes");
+        goto fail;
+    }
+
+    if (y->core->default_sample_spec.channels >= 2) {
+        if (cap->channel_mode & SBC_CHANNEL_MODE_JOINT_STEREO)
+            config.channel_mode = SBC_CHANNEL_MODE_JOINT_STEREO;
+        else if (cap->channel_mode & SBC_CHANNEL_MODE_STEREO)
+            config.channel_mode = SBC_CHANNEL_MODE_STEREO;
+        else if (cap->channel_mode & SBC_CHANNEL_MODE_DUAL_CHANNEL)
+            config.channel_mode = SBC_CHANNEL_MODE_DUAL_CHANNEL;
+        else {
+            pa_log_error("No supported channel modes");
+            goto fail;
+        }
+    }
+
+    pa_assert_se(r = dbus_message_new_method_return(m));
+    pa_assert_se(dbus_message_append_args(r, DBUS_TYPE_ARRAY, DBUS_TYPE_BYTE, &pconf, size, DBUS_TYPE_INVALID));
+
+    return r;
+
+fail:
+    pa_assert_se(r = dbus_message_new_error(m, "org.bluez.Error.InvalidArguments", "Unable to select configuration"));
+    return r;
+}
+
+static DBusMessage *endpoint_select_configuration(DBusConnection *conn, DBusMessage *m, void *userdata) {
+    return endpoint_select_configuration_aptx(conn, m, userdata);
 }
 
 static DBusMessage *endpoint_clear_configuration(DBusConnection *conn, DBusMessage *m, void *userdata) {

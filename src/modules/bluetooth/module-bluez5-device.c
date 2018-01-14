@@ -26,6 +26,7 @@
 
 #include <arpa/inet.h>
 #include <sbc/sbc.h>
+#include <libavcodec/avcodec.h>
 
 #include <pulse/rtclock.h>
 #include <pulse/timeval.h>
@@ -106,6 +107,23 @@ typedef struct sbc_info {
     size_t buffer_size;                  /* Size of the buffer */
 } sbc_info_t;
 
+typedef struct aptx {
+    AVCodec *codec;
+    AVCodecContext *ctx;
+    AVFrame *frame;
+    AVPacket *pkt;
+} aptx_t;
+
+typedef struct aptx_info {
+    aptx_t aptx;                         /* Codec data */
+    bool aptx_initialized;               /* Keep track if the encoder is initialized */
+    size_t codesize, frame_length;       /* SBC Codesize, frame_length. We simply cache those values here */
+    uint16_t seq_num;                    /* Cumulative packet sequence */
+
+    void* buffer;                        /* Codec transfer buffer */
+    size_t buffer_size;                  /* Size of the buffer */
+} aptx_info_t;
+
 struct userdata {
     pa_module *module;
     pa_core *core;
@@ -147,6 +165,7 @@ struct userdata {
     pa_memchunk write_memchunk;
     pa_sample_spec sample_spec;
     struct sbc_info sbc_info;
+    struct aptx_info aptx_info;
 };
 
 typedef enum pa_bluetooth_form_factor {
@@ -403,21 +422,152 @@ static int sco_process_push(struct userdata *u) {
 
 /* Run from IO thread */
 static void a2dp_prepare_buffer(struct userdata *u) {
+    void **buffer = NULL;
+    size_t *buffer_size = NULL;
+
     size_t min_buffer_size = PA_MAX(u->read_link_mtu, u->write_link_mtu);
 
     pa_assert(u);
 
-    if (u->sbc_info.buffer_size >= min_buffer_size)
+    if (u->transport->codec == A2DP_CODEC_SBC) {
+        buffer = &(u->sbc_info.buffer);
+        buffer_size = &(u->sbc_info.buffer_size);
+    } else if (u->transport->codec == A2DP_CODEC_VENDOR) {
+        buffer = &(u->aptx_info.buffer);
+        buffer_size = &(u->aptx_info.buffer_size);
+    } else {
+        pa_assert_not_reached();
+    }
+
+    if (*buffer_size >= min_buffer_size)
         return;
 
-    u->sbc_info.buffer_size = 2 * min_buffer_size;
-    pa_xfree(u->sbc_info.buffer);
-    u->sbc_info.buffer = pa_xmalloc(u->sbc_info.buffer_size);
+    *buffer_size = 2 * min_buffer_size;
+    pa_xfree(*buffer);
+    *buffer = pa_xmalloc(*buffer_size);
+
+    pa_log_debug("allocated buffer of size %lu", u->aptx_info.buffer_size);
+    pa_assert(u->aptx_info.buffer);
+
+}
+
+static int aptx_init(aptx_t *aptx) {
+	//struct aptxbtenc_encoder *e = (struct aptxbtenc_encoder *)enc;
+
+	// init context
+    AVDictionary *opts = NULL;
+	int ret = 0;
+
+	avcodec_register_all();
+    aptx->codec = avcodec_find_encoder(AV_CODEC_ID_APTX);
+    if (!aptx->codec) {
+        fprintf(stderr, "aptX codec not found\n");
+        exit(1);
+    }
+    aptx->ctx = avcodec_alloc_context3(aptx->codec);
+    if (!aptx->ctx) {
+        fprintf(stderr, "Could not allocate audio codec context\n");
+        exit(1);
+    }
+
+    // context params
+    aptx->ctx->sample_fmt     = AV_SAMPLE_FMT_S32P;
+    aptx->ctx->sample_rate    = 48000;
+    aptx->ctx->channel_layout = 3;
+    aptx->ctx->channels       =
+            av_get_channel_layout_nb_channels(aptx->ctx->channel_layout);
+    av_dict_set(&opts, "frame_size", "4", 0);
+    // open it
+    if (avcodec_open2(aptx->ctx, aptx->codec, &opts) < 0) {
+        fprintf(stderr, "Could not open codec\n");
+        exit(1);
+    }
+
+    // frame containing input raw audio
+    aptx->frame = av_frame_alloc();
+    if (!aptx->frame) {
+        fprintf(stderr, "Could not allocate audio frame\n");
+        exit(1);
+    }
+    aptx->frame->nb_samples     = aptx->ctx->frame_size;
+    aptx->frame->format         = aptx->ctx->sample_fmt;
+    aptx->frame->channel_layout = aptx->ctx->channel_layout;
+    ret = av_frame_get_buffer(aptx->frame, 0);
+    if (ret < 0) {
+        fprintf(stderr, "Could not allocate audio data buffers\n");
+        exit(1);
+    }
+    // packet for holding encoded output
+    aptx->pkt = av_packet_alloc();
+    if (!aptx->pkt) {
+        fprintf(stderr, "could not allocate the packet\n");
+        exit(1);
+    }
+
+    printf("nb_samples: %d, format: %d, channel_layout: %lu\n",
+           aptx->frame->nb_samples,
+           aptx->frame->format,
+           aptx->frame->channel_layout);
+
+	return 0;
+}
+
+static int aptx_encode_frame(
+		aptx_t *aptx,
+		const int32_t pcm[8],
+		uint16_t code[2]) {
+
+	int32_t *fillerL;
+	int32_t *fillerR;
+    int i;
+    int j;
+	int ret;
+
+	// write data to frame
+	ret = av_frame_make_writable(aptx->frame);
+	fillerL = (int32_t *)((aptx->frame->data)[0]);
+	fillerR = (int32_t *)((aptx->frame->data)[1]);
+
+	for (i = 0, j = 0; i < 4; ++i) {
+		fillerL[i] = pcm[j++];
+		fillerR[i] = pcm[j++];
+	}
+
+	// encode
+	ret = avcodec_send_frame(aptx->ctx, aptx->frame);
+    if (ret < 0) {
+        fprintf(stderr, "Bad send...\n");
+        return ret;
+    }
+    ret = avcodec_receive_packet(aptx->ctx, aptx->pkt);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        fprintf(stderr, "EAGAIN or EOF");
+        return 0;
+    } else if (ret < 0) {
+        fprintf(stderr, "Error encoding audio frame\n");
+        return ret;
+    }
+
+	// get data from packet
+	//code[0] = ((uint16_t *)aptx->pkt->data)[0];
+	//code[1] = ((uint16_t *)aptx->pkt->data)[1];
+    memcpy(code, aptx->pkt->data, 2 * sizeof(uint16_t));
+	av_packet_unref(aptx->pkt);
+
+	return 0;
+}
+
+static ssize_t aptx_encode(aptx_t *aptx, const void *input, size_t input_len,
+                           void *output, size_t output_len, ssize_t *written) {
+    aptx_encode_frame(aptx, input, output);
+    *written = (2 * sizeof(uint16_t));
+    return (8 * sizeof(int32_t));
 }
 
 /* Run from IO thread */
 static int a2dp_process_render(struct userdata *u) {
     struct sbc_info *sbc_info;
+    struct aptx_info *aptx_info;
     struct rtp_header *header;
     struct rtp_payload *payload;
     size_t nbytes;
@@ -425,6 +575,8 @@ static int a2dp_process_render(struct userdata *u) {
     const void *p;
     size_t to_write, to_encode;
     unsigned frame_count;
+    void **buffer;
+    uint16_t *seq_num;
     int ret = 0;
 
     pa_assert(u);
@@ -440,8 +592,17 @@ static int a2dp_process_render(struct userdata *u) {
     a2dp_prepare_buffer(u);
 
     sbc_info = &u->sbc_info;
-    header = sbc_info->buffer;
-    payload = (struct rtp_payload*) ((uint8_t*) sbc_info->buffer + sizeof(*header));
+    aptx_info = &u->aptx_info;
+
+    if (u->transport->codec == A2DP_CODEC_SBC) {
+        header = sbc_info->buffer;
+        payload = (struct rtp_payload*) ((uint8_t*) sbc_info->buffer + sizeof(*header));
+    } else if (u->transport->codec == A2DP_CODEC_VENDOR) {
+        header = NULL;
+        payload = NULL;
+    } else {
+        pa_assert_not_reached();
+    }
 
     frame_count = 0;
 
@@ -450,29 +611,57 @@ static int a2dp_process_render(struct userdata *u) {
     p = (const uint8_t *) pa_memblock_acquire_chunk(&u->write_memchunk);
     to_encode = u->write_memchunk.length;
 
-    d = (uint8_t*) sbc_info->buffer + sizeof(*header) + sizeof(*payload);
-    to_write = sbc_info->buffer_size - sizeof(*header) - sizeof(*payload);
+    if (u->transport->codec == A2DP_CODEC_SBC) {
+        d = (uint8_t*) sbc_info->buffer + sizeof(*header) + sizeof(*payload);
+        to_write = sbc_info->buffer_size - sizeof(*header) - sizeof(*payload);
+    } else if (u->transport->codec == A2DP_CODEC_VENDOR) {
+        d = (uint8_t*) aptx_info->buffer;
+        to_write = aptx_info->buffer_size;
+    } else {
+        pa_assert_not_reached();
+    }
 
     while (PA_LIKELY(to_encode > 0 && to_write > 0)) {
         ssize_t written;
         ssize_t encoded;
 
-        encoded = sbc_encode(&sbc_info->sbc,
-                             p, to_encode,
-                             d, to_write,
-                             &written);
+        if (u->transport->codec == A2DP_CODEC_SBC) {
+            encoded = sbc_encode(&sbc_info->sbc,
+                                 p, to_encode,
+                                 d, to_write,
+                                 &written);
 
-        if (PA_UNLIKELY(encoded <= 0)) {
-            pa_log_error("SBC encoding error (%li)", (long) encoded);
-            pa_memblock_release(u->write_memchunk.memblock);
-            return -1;
+            if (PA_UNLIKELY(encoded <= 0)) {
+                pa_log_error("SBC encoding error (%li)", (long) encoded);
+                pa_memblock_release(u->write_memchunk.memblock);
+                return -1;
+            }
+
+            pa_assert_fp((size_t) encoded <= to_encode);
+            pa_assert_fp((size_t) encoded == sbc_info->codesize);
+
+            pa_assert_fp((size_t) written <= to_write);
+            pa_assert_fp((size_t) written == sbc_info->frame_length);
+        } else if (u->transport->codec == A2DP_CODEC_VENDOR) {
+            encoded = aptx_encode(&aptx_info->aptx,
+                                  p, to_encode,
+                                  d, to_write,
+                                  &written);
+
+            if (PA_UNLIKELY(encoded <= 0)) {
+                pa_log_error("aptX encoding error (%li)", (long) encoded);
+                pa_memblock_release(u->write_memchunk.memblock);
+                return -1;
+            }
+
+            pa_assert_fp((size_t) encoded <= to_encode);
+            pa_assert_fp((size_t) encoded == aptx_info->codesize);
+
+            pa_assert_fp((size_t) written <= to_write);
+            pa_assert_fp((size_t) written == aptx_info->frame_length);
+        } else {
+            pa_assert_not_reached();
         }
-
-        pa_assert_fp((size_t) encoded <= to_encode);
-        pa_assert_fp((size_t) encoded == sbc_info->codesize);
-
-        pa_assert_fp((size_t) written <= to_write);
-        pa_assert_fp((size_t) written == sbc_info->frame_length);
 
         p = (const uint8_t*) p + encoded;
         to_encode -= encoded;
@@ -488,24 +677,39 @@ static int a2dp_process_render(struct userdata *u) {
     pa_assert(to_encode == 0);
 
     PA_ONCE_BEGIN {
-        pa_log_debug("Using SBC encoder implementation: %s", pa_strnull(sbc_get_implementation_info(&sbc_info->sbc)));
+        if (u->transport->codec == A2DP_CODEC_SBC) {
+            pa_log_debug("Using SBC encoder implementation: %s", pa_strnull(sbc_get_implementation_info(&sbc_info->sbc)));
+        } else if (u->transport->codec == A2DP_CODEC_VENDOR) {
+            pa_log_debug("Using aptX encoder implementation: %s", "openaptx beta");
+        }
     } PA_ONCE_END;
 
     /* write it to the fifo */
-    memset(sbc_info->buffer, 0, sizeof(*header) + sizeof(*payload));
-    header->v = 2;
-    header->pt = 1;
-    header->sequence_number = htons(sbc_info->seq_num++);
-    header->timestamp = htonl(u->write_index / pa_frame_size(&u->sample_spec));
-    header->ssrc = htonl(1);
-    payload->frame_count = frame_count;
+    buffer = NULL;
+    seq_num = NULL;
+    if (u->transport->codec == A2DP_CODEC_SBC) {
+        buffer = &(sbc_info->buffer);
+        seq_num = &(sbc_info->seq_num);
+        memset(*buffer, 0, sizeof(*header) + sizeof(*payload));
+        header->v = 2;
+        header->pt = 1;
+        header->sequence_number = htons((*seq_num)++);
+        header->timestamp = htonl(u->write_index / pa_frame_size(&u->sample_spec));
+        header->ssrc = htonl(1);
+        payload->frame_count = frame_count;
+    } else if (u->transport->codec == A2DP_CODEC_VENDOR) {
+        buffer = &(aptx_info->buffer);
+        seq_num = &(aptx_info->seq_num);
+    } else {
+        pa_assert_not_reached();
+    }
 
-    nbytes = (uint8_t*) d - (uint8_t*) sbc_info->buffer;
+    nbytes = (uint8_t *)d - (uint8_t *)(*buffer);
 
     for (;;) {
         ssize_t l;
 
-        l = pa_write(u->stream_fd, sbc_info->buffer, nbytes, &u->stream_write_type);
+        l = pa_write(u->stream_fd, *buffer, nbytes, &u->stream_write_type);
 
         pa_assert(l != 0);
 
@@ -517,6 +721,7 @@ static int a2dp_process_render(struct userdata *u) {
 
             else if (errno == EAGAIN)
                 /* Hmm, apparently the socket was not writable, give up for now */
+                pa_log_error("Failed to write data to socket: %s", pa_cstrerror(errno));
                 break;
 
             pa_log_error("Failed to write data to socket: %s", pa_cstrerror(errno));
@@ -792,7 +997,10 @@ static void transport_release(struct userdata *u) {
 
 /* Run from I/O thread */
 static void transport_config_mtu(struct userdata *u) {
-    if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT || u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY) {
+
+    if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT ||
+        u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY) {
+
         u->read_block_size = u->read_link_mtu;
         u->write_block_size = u->write_link_mtu;
 
@@ -806,28 +1014,45 @@ static void transport_config_mtu(struct userdata *u) {
             u->write_block_size = pa_frame_align(u->write_block_size, &u->sink->sample_spec);
         }
     } else {
-        u->read_block_size =
-            (u->read_link_mtu - sizeof(struct rtp_header) - sizeof(struct rtp_payload))
-            / u->sbc_info.frame_length * u->sbc_info.codesize;
+        if (u->transport->codec == A2DP_CODEC_SBC) {
+            u->read_block_size =
+                    (u->read_link_mtu - sizeof(struct rtp_header) - sizeof(struct rtp_payload))
+                        / u->sbc_info.frame_length * u->sbc_info.codesize;
 
-        u->write_block_size =
-            (u->write_link_mtu - sizeof(struct rtp_header) - sizeof(struct rtp_payload))
-            / u->sbc_info.frame_length * u->sbc_info.codesize;
+            u->write_block_size =
+                    (u->write_link_mtu - sizeof(struct rtp_header) - sizeof(struct rtp_payload))
+                        / u->sbc_info.frame_length * u->sbc_info.codesize;
+
+        } else if (u->transport->codec == A2DP_CODEC_VENDOR) {
+            //TODO: aptx sizes for these
+            u->read_block_size =
+                    (u->read_link_mtu - sizeof(struct rtp_header) - sizeof(struct rtp_payload))
+                        / u->aptx_info.frame_length * u->aptx_info.codesize;
+
+            u->write_block_size =
+                    (u->write_link_mtu - sizeof(struct rtp_header) - sizeof(struct rtp_payload))
+                        / u->aptx_info.frame_length * u->aptx_info.codesize;
+
+        }
     }
 
     if (u->sink) {
         pa_sink_set_max_request_within_thread(u->sink, u->write_block_size);
-        pa_sink_set_fixed_latency_within_thread(u->sink,
-                                                (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK ?
-                                                 FIXED_LATENCY_PLAYBACK_A2DP : FIXED_LATENCY_PLAYBACK_SCO) +
-                                                pa_bytes_to_usec(u->write_block_size, &u->sample_spec));
+        pa_sink_set_fixed_latency_within_thread(
+                u->sink,
+                (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK ?
+                    FIXED_LATENCY_PLAYBACK_A2DP :
+                    FIXED_LATENCY_PLAYBACK_SCO) +
+                            pa_bytes_to_usec(u->write_block_size, &u->sample_spec));
     }
 
     if (u->source)
-        pa_source_set_fixed_latency_within_thread(u->source,
-                                                  (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE ?
-                                                   FIXED_LATENCY_RECORD_A2DP : FIXED_LATENCY_RECORD_SCO) +
-                                                  pa_bytes_to_usec(u->read_block_size, &u->sample_spec));
+        pa_source_set_fixed_latency_within_thread(
+                u->source,
+                (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE ?
+                    FIXED_LATENCY_RECORD_A2DP :
+                    FIXED_LATENCY_RECORD_SCO) +
+                            pa_bytes_to_usec(u->read_block_size, &u->sample_spec));
 }
 
 /* Run from I/O thread */
@@ -1232,111 +1457,150 @@ static void transport_config(struct userdata *u) {
         u->sample_spec.channels = 1;
         u->sample_spec.rate = 8000;
     } else {
-        sbc_info_t *sbc_info = &u->sbc_info;
-        a2dp_sbc_t *config;
 
         pa_assert(u->transport);
 
-        u->sample_spec.format = PA_SAMPLE_S16LE;
-        config = (a2dp_sbc_t *) u->transport->config;
+        u->sample_spec.format = PA_SAMPLE_S32LE;
 
-        if (sbc_info->sbc_initialized)
-            sbc_reinit(&sbc_info->sbc, 0);
-        else
-            sbc_init(&sbc_info->sbc, 0);
-        sbc_info->sbc_initialized = true;
+        if (u->transport->codec == A2DP_CODEC_SBC) {
+            sbc_info_t *sbc_info = &u->sbc_info;
+            a2dp_sbc_t *config;
+            config = (a2dp_sbc_t *) u->transport->config;
+            if (sbc_info->sbc_initialized)
+                sbc_reinit(&sbc_info->sbc, 0);
+            else
+                sbc_init(&sbc_info->sbc, 0);
+            sbc_info->sbc_initialized = true;
 
-        switch (config->frequency) {
-            case SBC_SAMPLING_FREQ_16000:
-                sbc_info->sbc.frequency = SBC_FREQ_16000;
-                u->sample_spec.rate = 16000U;
-                break;
-            case SBC_SAMPLING_FREQ_32000:
-                sbc_info->sbc.frequency = SBC_FREQ_32000;
-                u->sample_spec.rate = 32000U;
-                break;
-            case SBC_SAMPLING_FREQ_44100:
-                sbc_info->sbc.frequency = SBC_FREQ_44100;
-                u->sample_spec.rate = 44100U;
-                break;
-            case SBC_SAMPLING_FREQ_48000:
-                sbc_info->sbc.frequency = SBC_FREQ_48000;
-                u->sample_spec.rate = 48000U;
-                break;
-            default:
-                pa_assert_not_reached();
+            switch (config->frequency) {
+                case SBC_SAMPLING_FREQ_16000:
+                    sbc_info->sbc.frequency = SBC_FREQ_16000;
+                    u->sample_spec.rate = 16000U;
+                    break;
+                case SBC_SAMPLING_FREQ_32000:
+                    sbc_info->sbc.frequency = SBC_FREQ_32000;
+                    u->sample_spec.rate = 32000U;
+                    break;
+                case SBC_SAMPLING_FREQ_44100:
+                    sbc_info->sbc.frequency = SBC_FREQ_44100;
+                    u->sample_spec.rate = 44100U;
+                    break;
+                case SBC_SAMPLING_FREQ_48000:
+                    sbc_info->sbc.frequency = SBC_FREQ_48000;
+                    u->sample_spec.rate = 48000U;
+                    break;
+                default:
+                    pa_assert_not_reached();
+            }
+
+            switch (config->channel_mode) {
+                case SBC_CHANNEL_MODE_MONO:
+                    sbc_info->sbc.mode = SBC_MODE_MONO;
+                    u->sample_spec.channels = 1;
+                    break;
+                case SBC_CHANNEL_MODE_DUAL_CHANNEL:
+                    sbc_info->sbc.mode = SBC_MODE_DUAL_CHANNEL;
+                    u->sample_spec.channels = 2;
+                    break;
+                case SBC_CHANNEL_MODE_STEREO:
+                    sbc_info->sbc.mode = SBC_MODE_STEREO;
+                    u->sample_spec.channels = 2;
+                    break;
+                case SBC_CHANNEL_MODE_JOINT_STEREO:
+                    sbc_info->sbc.mode = SBC_MODE_JOINT_STEREO;
+                    u->sample_spec.channels = 2;
+                    break;
+                default:
+                    pa_assert_not_reached();
+            }
+
+            switch (config->allocation_method) {
+                case SBC_ALLOCATION_SNR:
+                    sbc_info->sbc.allocation = SBC_AM_SNR;
+                    break;
+                case SBC_ALLOCATION_LOUDNESS:
+                    sbc_info->sbc.allocation = SBC_AM_LOUDNESS;
+                    break;
+                default:
+                    pa_assert_not_reached();
+            }
+
+            switch (config->subbands) {
+                case SBC_SUBBANDS_4:
+                    sbc_info->sbc.subbands = SBC_SB_4;
+                    break;
+                case SBC_SUBBANDS_8:
+                    sbc_info->sbc.subbands = SBC_SB_8;
+                    break;
+                default:
+                    pa_assert_not_reached();
+            }
+
+            switch (config->block_length) {
+                case SBC_BLOCK_LENGTH_4:
+                    sbc_info->sbc.blocks = SBC_BLK_4;
+                    break;
+                case SBC_BLOCK_LENGTH_8:
+                    sbc_info->sbc.blocks = SBC_BLK_8;
+                    break;
+                case SBC_BLOCK_LENGTH_12:
+                    sbc_info->sbc.blocks = SBC_BLK_12;
+                    break;
+                case SBC_BLOCK_LENGTH_16:
+                    sbc_info->sbc.blocks = SBC_BLK_16;
+                    break;
+                default:
+                    pa_assert_not_reached();
+            }
+
+            sbc_info->min_bitpool = config->min_bitpool;
+            sbc_info->max_bitpool = config->max_bitpool;
+
+            /* Set minimum bitpool for source to get the maximum possible block_size */
+            sbc_info->sbc.bitpool = u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK ? sbc_info->max_bitpool : sbc_info->min_bitpool;
+            sbc_info->codesize = sbc_get_codesize(&sbc_info->sbc);
+            sbc_info->frame_length = sbc_get_frame_length(&sbc_info->sbc);
+
+            pa_log_info("SBC parameters: allocation=%u, subbands=%u, blocks=%u, bitpool=%u",
+                        sbc_info->sbc.allocation,
+                        sbc_info->sbc.subbands ? 8 : 4,
+                        sbc_info->sbc.blocks,
+                        sbc_info->sbc.bitpool);
+        } else if (u->transport->codec == A2DP_CODEC_VENDOR) {
+            aptx_info_t *aptx_info = &u->aptx_info;
+            a2dp_aptx_t *config;
+            config = (a2dp_aptx_t *) u->transport->config;
+
+            if (!aptx_info->aptx_initialized) {
+                aptx_init(&aptx_info->aptx);
+                aptx_info->aptx_initialized = true;
+            }
+
+            aptx_info->codesize = 8 * sizeof(int32_t);
+            aptx_info->frame_length = 2 * sizeof(uint16_t);
+
+            switch (config->frequency) {
+                case APTX_SAMPLING_FREQ_16000:
+                    u->sample_spec.rate = 16000U;
+                    break;
+                case APTX_SAMPLING_FREQ_32000:
+                    u->sample_spec.rate = 32000U;
+                    break;
+                case APTX_SAMPLING_FREQ_44100:
+                    u->sample_spec.rate = 44100U;
+                    break;
+                case APTX_SAMPLING_FREQ_48000:
+                    u->sample_spec.rate = 48000U;
+                    break;
+                default:
+                    pa_assert_not_reached();
+            }
+
+            u->sample_spec.channels = 2;
+            pa_log_info("aptX parameters: sample_rate=%u", config->frequency);
+        } else {
+            pa_assert_not_reached();
         }
-
-        switch (config->channel_mode) {
-            case SBC_CHANNEL_MODE_MONO:
-                sbc_info->sbc.mode = SBC_MODE_MONO;
-                u->sample_spec.channels = 1;
-                break;
-            case SBC_CHANNEL_MODE_DUAL_CHANNEL:
-                sbc_info->sbc.mode = SBC_MODE_DUAL_CHANNEL;
-                u->sample_spec.channels = 2;
-                break;
-            case SBC_CHANNEL_MODE_STEREO:
-                sbc_info->sbc.mode = SBC_MODE_STEREO;
-                u->sample_spec.channels = 2;
-                break;
-            case SBC_CHANNEL_MODE_JOINT_STEREO:
-                sbc_info->sbc.mode = SBC_MODE_JOINT_STEREO;
-                u->sample_spec.channels = 2;
-                break;
-            default:
-                pa_assert_not_reached();
-        }
-
-        switch (config->allocation_method) {
-            case SBC_ALLOCATION_SNR:
-                sbc_info->sbc.allocation = SBC_AM_SNR;
-                break;
-            case SBC_ALLOCATION_LOUDNESS:
-                sbc_info->sbc.allocation = SBC_AM_LOUDNESS;
-                break;
-            default:
-                pa_assert_not_reached();
-        }
-
-        switch (config->subbands) {
-            case SBC_SUBBANDS_4:
-                sbc_info->sbc.subbands = SBC_SB_4;
-                break;
-            case SBC_SUBBANDS_8:
-                sbc_info->sbc.subbands = SBC_SB_8;
-                break;
-            default:
-                pa_assert_not_reached();
-        }
-
-        switch (config->block_length) {
-            case SBC_BLOCK_LENGTH_4:
-                sbc_info->sbc.blocks = SBC_BLK_4;
-                break;
-            case SBC_BLOCK_LENGTH_8:
-                sbc_info->sbc.blocks = SBC_BLK_8;
-                break;
-            case SBC_BLOCK_LENGTH_12:
-                sbc_info->sbc.blocks = SBC_BLK_12;
-                break;
-            case SBC_BLOCK_LENGTH_16:
-                sbc_info->sbc.blocks = SBC_BLK_16;
-                break;
-            default:
-                pa_assert_not_reached();
-        }
-
-        sbc_info->min_bitpool = config->min_bitpool;
-        sbc_info->max_bitpool = config->max_bitpool;
-
-        /* Set minimum bitpool for source to get the maximum possible block_size */
-        sbc_info->sbc.bitpool = u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK ? sbc_info->max_bitpool : sbc_info->min_bitpool;
-        sbc_info->codesize = sbc_get_codesize(&sbc_info->sbc);
-        sbc_info->frame_length = sbc_get_frame_length(&sbc_info->sbc);
-
-        pa_log_info("SBC parameters: allocation=%u, subbands=%u, blocks=%u, bitpool=%u",
-                    sbc_info->sbc.allocation, sbc_info->sbc.subbands ? 8 : 4, sbc_info->sbc.blocks, sbc_info->sbc.bitpool);
     }
 }
 
@@ -1514,9 +1778,11 @@ static void thread_func(void *userdata) {
                             if (skip_bytes > 0) {
                                 pa_memchunk tmp;
 
-                                pa_log_warn("Skipping %llu us (= %llu bytes) in audio stream",
+                                pa_log_warn("Skipping %llu us (= %llu bytes) in audio stream (%llu audio_sent vs %llu time_passed)",
                                             (unsigned long long) skip_usec,
-                                            (unsigned long long) skip_bytes);
+                                            (unsigned long long) skip_bytes,
+                                            (unsigned long long) audio_sent,
+                                            (unsigned long long) time_passed);
 
                                 pa_sink_render_full(u->sink, skip_bytes, &tmp);
                                 pa_memblock_unref(tmp.memblock);

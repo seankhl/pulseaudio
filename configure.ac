@@ -1029,6 +1029,8 @@ AC_SUBST(HAVE_DBUS)
 AM_CONDITIONAL([HAVE_DBUS], [test "x$HAVE_DBUS" = x1])
 AS_IF([test "x$HAVE_DBUS" = "x1"], AC_DEFINE([HAVE_DBUS], 1, [Have D-Bus.]))
 
+PKG_CHECK_MODULES(FFMPEG, libavcodec, HAVE_AVCODEC=yes)
+
 PA_MACHINE_ID="${sysconfdir}/machine-id"
 AX_DEFINE_DIR(PA_MACHINE_ID, PA_MACHINE_ID, [D-Bus machine-id file])
 PA_MACHINE_ID_FALLBACK="${localstatedir}/lib/dbus/machine-id"

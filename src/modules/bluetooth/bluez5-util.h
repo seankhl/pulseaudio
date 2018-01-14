@@ -147,6 +147,11 @@ static inline void pa_bluetooth_native_backend_free(pa_bluetooth_backend *b) {}
 static inline void pa_bluetooth_native_backend_enable_hs_role(pa_bluetooth_backend *b, bool enable_hs_role) {}
 #endif
 
+pa_bluetooth_transport *pa_bluetooth_transport_new2(
+                            pa_bluetooth_device *d,
+                            const char *owner, const char *path,
+                            pa_bluetooth_profile_t p,
+                            const uint8_t codec, const uint8_t *config, size_t size);
 pa_bluetooth_transport *pa_bluetooth_transport_new(pa_bluetooth_device *d, const char *owner, const char *path,
                                                    pa_bluetooth_profile_t p, const uint8_t *config, size_t size);
 
